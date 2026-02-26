@@ -40,6 +40,17 @@ Furthermore, you can validate whether your output file is formatted correctly by
 php tempest data:validate
 ```
 
+## Local server-like benchmarking (Docker)
+
+To run validation and benchmark flows in a containerized PHP 8.5 environment:
+
+```sh
+./scripts/docker-validate.sh
+./scripts/docker-benchmark.sh
+```
+
+Implementation details and optimization notes are documented in [`docs/IMPLEMENTATION.md`](./docs/IMPLEMENTATION.md).
+
 ## Output formatting rules
 
 You'll be parsing millions of CSV lines into a JSON file, with the following rules in mind:
