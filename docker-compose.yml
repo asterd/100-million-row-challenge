@@ -7,7 +7,7 @@ services:
     volumes:
       - .:/workspace
     environment:
-      PARSER_WORKERS: ${PARSER_WORKERS:-1}
+      PARSER_WORKERS: ${PARSER_WORKERS:-6}
     mem_limit: 1536m
     memswap_limit: 1536m
     cpus: 2.0
