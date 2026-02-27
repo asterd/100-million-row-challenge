@@ -9,7 +9,7 @@ use RuntimeException;
 
 final class Parser
 {
-    private const int READ_CHUNK = 12_582_912; // 12MB
+    private const int READ_CHUNK = 33_554_432; // 32MB
     private const int DISCOVER_SIZE = 8_388_608; // 8MB
     private const int URL_PREFIX_LEN = 25; // https://stitcher.io/blog/
     private const int WORKERS = 3;
@@ -204,15 +204,25 @@ final class Parser
                     $pathCount,
                     $dateCount,
                 );
-                file_put_contents($tmpFile, pack('V*', ...$wCounts));
-                exit(0);
+                $payload = pack('V*', ...$wCounts);
+                if ($payload === '') {
+                    exit(2);
+                }
+
+                $ok = file_put_contents($tmpFile, $payload);
+                exit($ok === false ? 3 : 0);
             }
 
             if ($pid < 0) {
                 throw new RuntimeException('Fork failed');
             }
 
-            $children[] = [$pid, $tmpFile];
+            $children[] = [
+                'pid' => $pid,
+                'start' => $boundaries[$w],
+                'end' => $boundaries[$w + 1],
+                'tmpFile' => $tmpFile,
+            ];
         }
 
         $counts = $this->parseRange(
@@ -225,26 +235,43 @@ final class Parser
             $dateCount,
         );
 
-        foreach ($children as [$cpid, $tmpFile]) {
-            pcntl_waitpid($cpid, $status);
-            $payload = file_get_contents($tmpFile);
+        foreach ($children as $child) {
+            pcntl_waitpid($child['pid'], $status);
+            $childOk = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
+            $payload = $childOk ? file_get_contents($child['tmpFile']) : false;
+            @unlink($child['tmpFile']);
 
             if ($payload !== false) {
                 $wCounts = unpack('V*', $payload);
-
                 if (is_array($wCounts)) {
-                    $j = 0;
-
-                    foreach ($wCounts as $v) {
-                        $counts[$j++] += $v;
-                    }
+                    $this->mergeCounts($counts, $wCounts);
+                    continue;
                 }
             }
 
-            @unlink($tmpFile);
+            // Robust fallback if worker transport fails.
+            $fallback = $this->parseRange(
+                $inputPath,
+                $child['start'],
+                $child['end'],
+                $pathIds,
+                $dateIds,
+                $pathCount,
+                $dateCount,
+            );
+            $this->mergeCounts($counts, $fallback);
         }
 
         $this->writeJson($outputPath, $paths, $pathCount, $dates, $dateCount, $counts);
+    }
+
+    /** @param array<int, int> $counts @param iterable<int, int> $partial */
+    private function mergeCounts(array &$counts, iterable $partial): void
+    {
+        $j = 0;
+        foreach ($partial as $value) {
+            $counts[$j++] += $value;
+        }
     }
 
     /**
@@ -301,12 +328,13 @@ final class Parser
             $slugStart = self::URL_PREFIX_LEN;
 
             while ($slugStart < $lastNl) {
-                $commaPos = strpos($chunk, ',', $slugStart);
+                $nlPos = strpos($chunk, "\n", $slugStart);
+                $commaPos = $nlPos - 26;
                 $slug = substr($chunk, $slugStart, $commaPos - $slugStart);
                 $dateKey = substr($chunk, $commaPos + 3, 8); // YY-MM-DD
                 $counts[$pathIds[$slug] + $dateIds[$dateKey]]++;
 
-                $slugStart = $commaPos + 52;
+                $slugStart = $nlPos + 26;
             }
         }
 
