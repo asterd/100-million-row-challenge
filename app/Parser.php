@@ -9,10 +9,37 @@ use RuntimeException;
 
 final class Parser
 {
-    private const int READ_CHUNK = 33_554_432; // 32MB
-    private const int DISCOVER_SIZE = 8_388_608; // 8MB
-    private const int URL_PREFIX_LEN = 25; // https://stitcher.io/blog/
-    private const int WORKERS = 3;
+    private const int READ_CHUNK    = 67_108_864; // 64 MB — meno syscall fread
+    private const int DISCOVER_SIZE =  8_388_608; //  8 MB
+    private const int URL_PREFIX_LEN = 25;        // strlen("https://stitcher.io/blog/")
+
+    // Numero di worker determinato runtime in base ai core logici disponibili.
+    // Capped a 16 per non saturare il fork overhead su macchine molto grandi.
+    private int $workers;
+
+    public function __construct()
+    {
+        $this->workers = $this->detectWorkers();
+    }
+
+    private function detectWorkers(): int
+    {
+        // Legge i core disponibili senza dipendenze esterne.
+        $cores = 1;
+        if (is_readable('/proc/cpuinfo')) {
+            $cpuinfo = file_get_contents('/proc/cpuinfo');
+            if ($cpuinfo !== false) {
+                $cores = max(1, substr_count($cpuinfo, "\nprocessor\t:"));
+            }
+        } elseif (function_exists('shell_exec')) {
+            $n = (int) shell_exec('nproc 2>/dev/null');
+            if ($n > 0) {
+                $cores = $n;
+            }
+        }
+        // Usa tutti i core ma cap a 16
+        return min(max(1, $cores), 16);
+    }
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -40,6 +67,7 @@ final class Parser
             function_exists('pcntl_fork')
             && function_exists('pcntl_waitpid')
             && $fileSize > self::DISCOVER_SIZE
+            && $this->workers > 1
         ) {
             $this->parseParallel(
                 $inputPath,
@@ -71,8 +99,8 @@ final class Parser
     /** @return array{0: array<string,int>, 1: array<int,string>, 2:int} */
     private function buildDateMap(): array
     {
-        $dateIds = [];
-        $dates = [];
+        $dateIds  = [];
+        $dates    = [];
         $dateCount = 0;
 
         for ($y = 20; $y <= 26; $y++) {
@@ -80,17 +108,17 @@ final class Parser
 
             for ($m = 1; $m <= 12; $m++) {
                 $maxD = match ($m) {
-                    2 => (($y + 2000) % 4 === 0) ? 29 : 28,
+                    2       => (($y + 2000) % 4 === 0) ? 29 : 28,
                     4, 6, 9, 11 => 30,
                     default => 31,
                 };
 
-                $mStr = ($m < 10 ? '0' : '') . $m;
+                $mStr  = ($m < 10 ? '0' : '') . $m;
                 $ymStr = $yStr . '-' . $mStr . '-';
 
                 for ($d = 1; $d <= $maxD; $d++) {
-                    $key = $ymStr . (($d < 10 ? '0' : '') . $d);
-                    $dateIds[$key] = $dateCount;
+                    $key             = $ymStr . (($d < 10 ? '0' : '') . $d);
+                    $dateIds[$key]   = $dateCount;
                     $dates[$dateCount] = $key;
                     $dateCount++;
                 }
@@ -103,8 +131,8 @@ final class Parser
     /** @return array{0: array<string,int>, 1: array<int,string>, 2:int} */
     private function discoverPaths(string $inputPath, int $fileSize, int $dateCount): array
     {
-        $pathIds = [];
-        $paths = [];
+        $pathIds   = [];
+        $paths     = [];
         $pathCount = 0;
 
         $handle = fopen($inputPath, 'rb');
@@ -115,22 +143,21 @@ final class Parser
 
         stream_set_read_buffer($handle, 0);
         $discoverSize = $fileSize > self::DISCOVER_SIZE ? self::DISCOVER_SIZE : $fileSize;
-        $chunk = fread($handle, $discoverSize);
+        $chunk        = fread($handle, $discoverSize);
         fclose($handle);
 
         if (is_string($chunk) && $chunk !== '') {
-            $lastNl = strrpos($chunk, "\n");
+            $lastNl    = strrpos($chunk, "\n");
 
             if (is_int($lastNl)) {
                 $slugStart = self::URL_PREFIX_LEN;
 
                 while ($slugStart < $lastNl) {
                     $commaPos = strpos($chunk, ',', $slugStart);
-
-                    $slug = substr($chunk, $slugStart, $commaPos - $slugStart);
+                    $slug     = substr($chunk, $slugStart, $commaPos - $slugStart);
 
                     if (! isset($pathIds[$slug])) {
-                        $pathIds[$slug] = $pathCount * $dateCount;
+                        $pathIds[$slug]    = $pathCount * $dateCount;
                         $paths[$pathCount] = $slug;
                         $pathCount++;
                     }
@@ -144,7 +171,7 @@ final class Parser
             $slug = substr($visit->uri, self::URL_PREFIX_LEN);
 
             if (! isset($pathIds[$slug])) {
-                $pathIds[$slug] = $pathCount * $dateCount;
+                $pathIds[$slug]    = $pathCount * $dateCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
@@ -162,23 +189,24 @@ final class Parser
     private function parseParallel(
         string $inputPath,
         string $outputPath,
-        int $fileSize,
-        array $pathIds,
-        array $paths,
-        int $pathCount,
-        array $dateIds,
-        array $dates,
-        int $dateCount,
+        int    $fileSize,
+        array  $pathIds,
+        array  $paths,
+        int    $pathCount,
+        array  $dateIds,
+        array  $dates,
+        int    $dateCount,
     ): void {
+        $workers    = $this->workers;
         $boundaries = [0];
-        $bh = fopen($inputPath, 'rb');
+        $bh         = fopen($inputPath, 'rb');
 
         if ($bh === false) {
             throw new RuntimeException("Unable to open input file: {$inputPath}");
         }
 
-        for ($i = 1; $i < self::WORKERS; $i++) {
-            fseek($bh, (int) ($fileSize * $i / self::WORKERS));
+        for ($i = 1; $i < $workers; $i++) {
+            fseek($bh, (int) ($fileSize * $i / $workers));
             fgets($bh);
             $boundaries[] = ftell($bh);
         }
@@ -186,15 +214,17 @@ final class Parser
         fclose($bh);
         $boundaries[] = $fileSize;
 
-        $tmpDir = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
-        $myPid = getmypid();
+        $tmpDir  = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $myPid   = getmypid();
         $children = [];
 
-        for ($w = 0; $w < self::WORKERS - 1; $w++) {
+        // Forka tutti i worker tranne l'ultimo che gira nel processo padre.
+        for ($w = 0; $w < $workers - 1; $w++) {
             $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
-            $pid = pcntl_fork();
+            $pid     = pcntl_fork();
 
             if ($pid === 0) {
+                // --- WORKER CHILD ---
                 $wCounts = $this->parseRange(
                     $inputPath,
                     $boundaries[$w],
@@ -204,11 +234,11 @@ final class Parser
                     $pathCount,
                     $dateCount,
                 );
+                // Serializza con pack V* (uint32 little-endian, stesso del codice originale)
                 $payload = pack('V*', ...$wCounts);
                 if ($payload === '') {
                     exit(2);
                 }
-
                 $ok = file_put_contents($tmpFile, $payload);
                 exit($ok === false ? 3 : 0);
             }
@@ -218,17 +248,18 @@ final class Parser
             }
 
             $children[] = [
-                'pid' => $pid,
-                'start' => $boundaries[$w],
-                'end' => $boundaries[$w + 1],
+                'pid'     => $pid,
+                'start'   => $boundaries[$w],
+                'end'     => $boundaries[$w + 1],
                 'tmpFile' => $tmpFile,
             ];
         }
 
+        // Padre elabora l'ultimo slice.
         $counts = $this->parseRange(
             $inputPath,
-            $boundaries[self::WORKERS - 1],
-            $boundaries[self::WORKERS],
+            $boundaries[$workers - 1],
+            $boundaries[$workers],
             $pathIds,
             $dateIds,
             $pathCount,
@@ -241,7 +272,7 @@ final class Parser
             $payload = $childOk ? file_get_contents($child['tmpFile']) : false;
             @unlink($child['tmpFile']);
 
-            if ($payload !== false) {
+            if ($payload !== false && $payload !== '') {
                 $wCounts = unpack('V*', $payload);
                 if (is_array($wCounts)) {
                     $this->mergeCounts($counts, $wCounts);
@@ -249,7 +280,7 @@ final class Parser
                 }
             }
 
-            // Robust fallback if worker transport fails.
+            // Fallback se il worker ha fallito.
             $fallback = $this->parseRange(
                 $inputPath,
                 $child['start'],
@@ -275,20 +306,29 @@ final class Parser
     }
 
     /**
+     * Loop critico — ottimizzato con explode() al posto di strpos() ripetuto
+     * e carry buffer al posto di fseek() backward.
+     *
      * @param array<string, int> $pathIds
      * @param array<string, int> $dateIds
      * @return array<int, int>
      */
     private function parseRange(
         string $inputPath,
-        int $start,
-        int $end,
-        array $pathIds,
-        array $dateIds,
-        int $pathCount,
-        int $dateCount,
+        int    $start,
+        int    $end,
+        array  $pathIds,
+        array  $dateIds,
+        int    $pathCount,
+        int    $dateCount,
     ): array {
-        $counts = array_fill(0, $pathCount * $dateCount, 0);
+        // SplFixedArray evita la riallocazione della hash-map PHP per l'array piatto
+        // e accede all'indice in O(1) senza overhead di bucket.
+        $total  = $pathCount * $dateCount;
+        $counts = new \SplFixedArray($total);
+        for ($i = 0; $i < $total; $i++) {
+            $counts[$i] = 0;
+        }
 
         $handle = fopen($inputPath, 'rb');
 
@@ -298,63 +338,92 @@ final class Parser
 
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
+
         $remaining = $end - $start;
+        $carry     = '';           // buffer della riga parziale del chunk precedente
+        $prefixLen = self::URL_PREFIX_LEN;
 
         while ($remaining > 0) {
             $toRead = $remaining > self::READ_CHUNK ? self::READ_CHUNK : $remaining;
-            $chunk = fread($handle, $toRead);
-            $chunkLen = strlen($chunk);
+            $raw    = fread($handle, $toRead);
 
-            if ($chunkLen === 0) {
+            if ($raw === false || $raw === '') {
                 break;
             }
 
+            $chunkLen   = strlen($raw);
             $remaining -= $chunkLen;
+
+            // Unisce il carry con il nuovo chunk.
+            // Se il chunk non termina con \n, separa l'ultima riga parziale come nuovo carry.
+            $chunk = $carry . $raw;
+            $raw   = ''; // libera memoria subito
+
             $lastNl = strrpos($chunk, "\n");
 
             if ($lastNl === false) {
-                fseek($handle, -$chunkLen, SEEK_CUR);
-                $remaining += $chunkLen;
-                break;
+                // Non ci sono newline: tutto il chunk è carry (caso limite)
+                $carry = $chunk;
+                continue;
             }
 
-            $tail = $chunkLen - $lastNl - 1;
+            // Salva la parte dopo l'ultimo \n come carry per il prossimo round.
+            $carry = substr($chunk, $lastNl + 1);
 
-            if ($tail > 0) {
-                fseek($handle, -$tail, SEEK_CUR);
-                $remaining += $tail;
-            }
+            // ----------------------------------------------------------------
+            // HOT PATH: explode su \n produce un array di righe senza loop
+            // strpos/strrpos ripetuti. Ogni elemento è già una riga completa.
+            // ----------------------------------------------------------------
+            $lines = explode("\n", substr($chunk, 0, $lastNl));
+            $chunk = ''; // libera memoria
 
-            $slugStart = self::URL_PREFIX_LEN;
+            foreach ($lines as $line) {
+                if ($line === '') {
+                    continue;
+                }
 
-            while ($slugStart < $lastNl) {
-                $nlPos = strpos($chunk, "\n", $slugStart);
-                $commaPos = $nlPos - 26;
-                $slug = substr($chunk, $slugStart, $commaPos - $slugStart);
-                $dateKey = substr($chunk, $commaPos + 3, 8); // YY-MM-DD
-                $counts[$pathIds[$slug] + $dateIds[$dateKey]]++;
+                // Formato: https://stitcher.io/blog/<slug>,20YY-MM-DD HH:MM:SS,<ip>
+                // commaPos = posizione della prima virgola dopo il prefisso
+                $commaPos = strpos($line, ',', $prefixLen);
 
-                $slugStart = $nlPos + 26;
+                if ($commaPos === false) {
+                    continue; // riga malformata
+                }
+
+                // Slug: da $prefixLen a $commaPos
+                $slug = substr($line, $prefixLen, $commaPos - $prefixLen);
+
+                // Data: "20YY-MM-DD" parte da $commaPos+1, ma vogliamo solo "YY-MM-DD"
+                // Il codice originale usa commaPos+3 per saltare "20" → 8 caratteri
+                $dateKey = substr($line, $commaPos + 3, 8);
+
+                // Accesso diretto senza isset() — fallisce silenziosamente
+                // solo se slug/date non sono nel dizionario (non dovrebbe accadere).
+                if (isset($pathIds[$slug], $dateIds[$dateKey])) {
+                    $idx           = $pathIds[$slug] + $dateIds[$dateKey];
+                    $counts[$idx]++;
+                }
             }
         }
 
         fclose($handle);
 
-        return $counts;
+        // Converte SplFixedArray in array PHP per compatibilità con mergeCounts
+        return $counts->toArray();
     }
 
     /**
      * @param array<int, string> $paths
      * @param array<int, string> $dates
-     * @param array<int, int> $counts
+     * @param array<int, int>    $counts
      */
     private function writeJson(
         string $outputPath,
-        array $paths,
-        int $pathCount,
-        array $dates,
-        int $dateCount,
-        array $counts,
+        array  $paths,
+        int    $pathCount,
+        array  $dates,
+        int    $dateCount,
+        array  $counts,
     ): void {
         $datePrefixes = [];
 
@@ -380,7 +449,7 @@ final class Parser
         $firstPath = true;
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base = $p * $dateCount;
+            $base       = $p * $dateCount;
             $dateEntries = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
