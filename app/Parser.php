@@ -322,13 +322,9 @@ final class Parser
         int    $pathCount,
         int    $dateCount,
     ): array {
-        // SplFixedArray evita la riallocazione della hash-map PHP per l'array piatto
-        // e accede all'indice in O(1) senza overhead di bucket.
-        $total  = $pathCount * $dateCount;
-        $counts = new \SplFixedArray($total);
-        for ($i = 0; $i < $total; $i++) {
-            $counts[$i] = 0;
-        }
+        // Array PHP nativo: supporta $arr[$i]++ in-place nel hot path.
+        // SplFixedArray non supporta l'incremento indiretto (ArrayAccess overhead).
+        $counts = array_fill(0, $pathCount * $dateCount, 0);
 
         $handle = fopen($inputPath, 'rb');
 
@@ -401,15 +397,14 @@ final class Parser
                 // solo se slug/date non sono nel dizionario (non dovrebbe accadere).
                 if (isset($pathIds[$slug], $dateIds[$dateKey])) {
                     $idx           = $pathIds[$slug] + $dateIds[$dateKey];
-                    $counts[$idx]++;
+                    $counts[$idx] = $counts[$idx] + 1;
                 }
             }
         }
 
         fclose($handle);
 
-        // Converte SplFixedArray in array PHP per compatibilità con mergeCounts
-        return $counts->toArray();
+        return $counts;
     }
 
     /**
