@@ -12,7 +12,7 @@ final class Parser
     private const int READ_CHUNK = 12_582_912; // 12MB
     private const int DISCOVER_SIZE = 8_388_608; // 8MB
     private const int URL_PREFIX_LEN = 25; // https://stitcher.io/blog/
-    private const int WORKERS = 4;
+    private const int WORKERS = 3;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -56,7 +56,15 @@ final class Parser
             return;
         }
 
-        $counts = $this->parseRange($inputPath, 0, $fileSize, $pathIds, $dateIds, $pathCount, $dateCount);
+        $counts = $this->parseRange(
+            $inputPath,
+            0,
+            $fileSize,
+            $pathIds,
+            $dateIds,
+            $pathCount,
+            $dateCount,
+        );
         $this->writeJson($outputPath, $paths, $pathCount, $dates, $dateCount, $counts);
     }
 
@@ -294,11 +302,6 @@ final class Parser
 
             while ($slugStart < $lastNl) {
                 $commaPos = strpos($chunk, ',', $slugStart);
-
-                if ($commaPos === false) {
-                    break;
-                }
-
                 $slug = substr($chunk, $slugStart, $commaPos - $slugStart);
                 $dateKey = substr($chunk, $commaPos + 3, 8); // YY-MM-DD
                 $counts[$pathIds[$slug] + $dateIds[$dateKey]]++;
