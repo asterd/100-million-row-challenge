@@ -324,7 +324,7 @@ final class Parser
 
         for ($w = 0; $w < $workers - 1; $w++) {
             $key   = 0x100000 + ($myPid & 0xFFFF) * 16 + $w;
-            $shmId = @shmop_open($key, 'n', 0600, $shmSize);
+            $shmId = $this->tryShmOpen($key, 'n', 0600, $shmSize);
             if ($shmId === false) {
                 for ($x = 0; $x < $w; $x++) {
                     shmop_delete($shmIds[$x]);
@@ -351,7 +351,7 @@ final class Parser
                     $pathIds, $dateIds, $pathCount, $dateCount,
                 );
                 $bin      = pack('V*', ...$wCounts);
-                $childShm = @shmop_open($shmKeys[$w], 'w', 0, 0);
+                $childShm = $this->tryShmOpen($shmKeys[$w], 'w', 0, 0);
                 if ($childShm !== false) {
                     shmop_write($childShm, $bin, 0);
                     shmop_close($childShm);
@@ -373,23 +373,25 @@ final class Parser
 
             if ($ok) {
                 $bin     = shmop_read($shmIds[$w], 0, $shmSize);
-                $wCounts = unpack('V*', $bin);
-                if (is_array($wCounts)) {
+                $wCounts = is_string($bin) ? unpack('V*', $bin) : false;
+                if (is_array($wCounts) && count($wCounts) === $cellCount) {
                     $j = 1;
                     for ($i = 0; $i < $cellCount; $i++) {
                         $counts[$i] += $wCounts[$j++];
                     }
-                }
-            } else {
-                $fallback = $this->parseRange(
-                    $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $pathIds, $dateIds, $pathCount, $dateCount,
-                );
-                for ($i = 0; $i < $cellCount; $i++) {
-                    $counts[$i] += $fallback[$i];
+                    shmop_delete($shmIds[$w]);
+                    shmop_close($shmIds[$w]);
+                    continue;
                 }
             }
 
+            $fallback = $this->parseRange(
+                $inputPath, $boundaries[$w], $boundaries[$w + 1],
+                $pathIds, $dateIds, $pathCount, $dateCount,
+            );
+            for ($i = 0; $i < $cellCount; $i++) {
+                $counts[$i] += $fallback[$i];
+            }
             shmop_delete($shmIds[$w]);
             shmop_close($shmIds[$w]);
         }
@@ -733,6 +735,22 @@ final class Parser
             if ($c > 0) return min($c, 16);
         }
         return 4;
+    }
+
+    private function tryShmOpen(int $key, string $mode, int $permissions, int $size): mixed
+    {
+        $previous = set_error_handler(static fn (): bool => true);
+        try {
+            return shmop_open($key, $mode, $permissions, $size);
+        } catch (\Throwable) {
+            return false;
+        } finally {
+            if ($previous !== null) {
+                set_error_handler($previous);
+            } else {
+                restore_error_handler();
+            }
+        }
     }
 
     private function findAutoloader(): string
