@@ -35,16 +35,28 @@ final class Parser
         [$dateIds, $dates, $dateCount] = $this->buildDateMap();
         [$pathIds, $paths, $pathCount] = $this->discoverPaths($inputPath, $fileSize, $dateCount);
 
-        // Detect available CPU cores for optimal parallelism.
-        // M1 Mac Mini (benchmark server) has 8 performance cores.
         $workers = $this->detectCores();
+
+        if (
+            function_exists('pcntl_fork')
+            && function_exists('pcntl_waitpid')
+            && function_exists('shmop_open')
+            && $fileSize > self::DISCOVER_SIZE
+        ) {
+            $this->parseParallelShmop(
+                $inputPath, $outputPath, $fileSize,
+                $pathIds, $paths, $pathCount,
+                $dateIds, $dates, $dateCount,
+                $workers,
+            );
+            return;
+        }
 
         if (
             class_exists(\parallel\Runtime::class)
             && $fileSize > self::DISCOVER_SIZE
-            && $workers > 1
         ) {
-            $this->parseParallel(
+            $this->parseParallelRuntime(
                 $inputPath, $outputPath, $fileSize,
                 $pathIds, $paths, $pathCount,
                 $dateIds, $dates, $dateCount,
@@ -62,7 +74,7 @@ final class Parser
                 $inputPath, $outputPath, $fileSize,
                 $pathIds, $paths, $pathCount,
                 $dateIds, $dates, $dateCount,
-                min($workers, 8),
+                $workers,
             );
             return;
         }
@@ -73,19 +85,15 @@ final class Parser
 
     private function detectCores(): int
     {
-        // Try nproc first (Linux/macOS with coreutils)
         if (function_exists('shell_exec')) {
             $n = (int) shell_exec('nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null');
-            if ($n > 0) {
-                return min($n, 16);
-            }
+            if ($n > 0) return min($n, 16);
         }
-        // /proc/cpuinfo fallback
         if (is_readable('/proc/cpuinfo')) {
             $c = substr_count((string) file_get_contents('/proc/cpuinfo'), "\nprocessor\t:");
             if ($c > 0) return min($c, 16);
         }
-        return 4; // safe default for M1
+        return 4;
     }
 
     /** @return array{0: array<string,int>, 1: array<int,string>, 2:int} */
@@ -125,13 +133,10 @@ final class Parser
         $pathCount = 0;
 
         $handle = fopen($inputPath, 'rb');
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open input file: {$inputPath}");
-        }
+        if ($handle === false) throw new RuntimeException("Unable to open: {$inputPath}");
 
         stream_set_read_buffer($handle, 0);
-        $discoverSize = min($fileSize, self::DISCOVER_SIZE);
-        $chunk        = fread($handle, $discoverSize);
+        $chunk = fread($handle, min($fileSize, self::DISCOVER_SIZE));
         fclose($handle);
 
         if (is_string($chunk) && $chunk !== '') {
@@ -163,17 +168,40 @@ final class Parser
         return [$pathIds, $paths, $pathCount];
     }
 
+    /** @return array<int,int> */
+    private function buildBoundaries(string $inputPath, int $fileSize, int $workers): array
+    {
+        $boundaries = [0];
+        $bh = fopen($inputPath, 'rb');
+        if ($bh === false) throw new RuntimeException("Cannot open: {$inputPath}");
+        for ($i = 1; $i < $workers; $i++) {
+            fseek($bh, (int) ($fileSize * $i / $workers));
+            fgets($bh);
+            $boundaries[] = (int) ftell($bh);
+        }
+        fclose($bh);
+        $boundaries[] = $fileSize;
+        return $boundaries;
+    }
+
     /**
-     * Parallel path using ext-parallel (true threads, zero IPC file I/O).
-     * Each Runtime gets its own thread; Future::value() returns the result array
-     * directly — no pack/unpack, no /dev/shm writes.
+     * FASTEST PATH: pcntl_fork + shmop shared memory.
+     *
+     * Each child writes its $counts array directly into a pre-allocated
+     * shared memory segment as a packed binary string. The parent reads
+     * all segments simultaneously after waitpid — zero filesystem I/O,
+     * zero pack/unpack round-trips through /dev/shm files.
+     *
+     * Layout of each shmop segment: N * 4 bytes (uint32 little-endian).
+     * Children write with pack('V*'), parent reads with unpack('V*').
+     * The segment is pre-allocated before fork so children only write.
      *
      * @param array<string,int> $pathIds
      * @param array<int,string> $paths
      * @param array<string,int> $dateIds
      * @param array<int,string> $dates
      */
-    private function parseParallel(
+    private function parseParallelShmop(
         string $inputPath,
         string $outputPath,
         int    $fileSize,
@@ -185,12 +213,118 @@ final class Parser
         int    $dateCount,
         int    $workers,
     ): void {
-        // Split file into $workers equal byte-aligned slices.
-        $boundaries = $this->buildBoundaries($inputPath, $fileSize, $workers);
+        $total       = $pathCount * $dateCount;
+        $segmentSize = $total * 4; // 4 bytes per uint32
+        $boundaries  = $this->buildBoundaries($inputPath, $fileSize, $workers);
 
+        // Pre-allocate shared memory segments — one per child worker.
+        // IPC key: use a unique key per worker based on PID to avoid collisions.
+        $myPid    = getmypid();
+        $shmKeys  = [];
+        $shmIds   = [];
+
+        for ($w = 0; $w < $workers - 1; $w++) {
+            // Use ftok-style unique integer key
+            $key = 0x100000 + ($myPid % 0xFFFF) * 16 + $w;
+            // SHM_OPEN: 0666 create new, size = segmentSize
+            $shmId = shmop_open($key, 'n', 0666, $segmentSize);
+            if ($shmId === false) {
+                // Key collision — try to delete and recreate
+                $shmId = shmop_open($key, 'c', 0666, $segmentSize);
+            }
+            $shmKeys[$w] = $key;
+            $shmIds[$w]  = $shmId;
+        }
+
+        $children = [];
+
+        for ($w = 0; $w < $workers - 1; $w++) {
+            $pid = pcntl_fork();
+
+            if ($pid === 0) {
+                // CHILD: parse slice, write result directly to shared memory
+                $wCounts = $this->parseRange(
+                    $inputPath, $boundaries[$w], $boundaries[$w + 1],
+                    $pathIds, $dateIds, $pathCount, $dateCount,
+                );
+                // pack to binary and write to shm segment
+                $payload = pack('V*', ...$wCounts);
+                shmop_write($shmIds[$w], $payload, 0);
+                exit(0);
+            }
+
+            if ($pid < 0) throw new RuntimeException('Fork failed');
+            $children[$w] = $pid;
+        }
+
+        // Parent parses last slice while children work in parallel
+        $counts = $this->parseRange(
+            $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
+            $pathIds, $dateIds, $pathCount, $dateCount,
+        );
+
+        // Wait for all children and merge from shared memory
+        foreach ($children as $w => $pid) {
+            pcntl_waitpid($pid, $status);
+
+            $shmId = $shmIds[$w];
+            if ($shmId !== false) {
+                $childOk = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
+                if ($childOk) {
+                    $payload = shmop_read($shmId, 0, $segmentSize);
+                    if ($payload !== false) {
+                        $wCounts = unpack('V*', $payload);
+                        if (is_array($wCounts)) {
+                            // Merge: tight for-loop is faster than foreach + iterator
+                            $j   = 1; // unpack is 1-indexed
+                            for ($i = 0; $i < $total; $i++) {
+                                $counts[$i] += $wCounts[$j++];
+                            }
+                        }
+                    }
+                }
+                shmop_delete($shmId);
+                shmop_close($shmId);
+
+                if (! $childOk) {
+                    // Fallback: re-parse failed worker's slice in parent
+                    $fallback = $this->parseRange(
+                        $inputPath, $boundaries[$w], $boundaries[$w + 1],
+                        $pathIds, $dateIds, $pathCount, $dateCount,
+                    );
+                    for ($i = 0; $i < $total; $i++) {
+                        $counts[$i] += $fallback[$i];
+                    }
+                }
+            }
+        }
+
+        $this->writeJson($outputPath, $paths, $pathCount, $dates, $dateCount, $counts);
+    }
+
+    /**
+     * Second path: ext-parallel (true threads, no fork overhead).
+     *
+     * @param array<string,int> $pathIds
+     * @param array<int,string> $paths
+     * @param array<string,int> $dateIds
+     * @param array<int,string> $dates
+     */
+    private function parseParallelRuntime(
+        string $inputPath,
+        string $outputPath,
+        int    $fileSize,
+        array  $pathIds,
+        array  $paths,
+        int    $pathCount,
+        array  $dateIds,
+        array  $dates,
+        int    $dateCount,
+        int    $workers,
+    ): void {
+        $boundaries = $this->buildBoundaries($inputPath, $fileSize, $workers);
         $autoloader = $this->findAutoloader();
 
-        // Closure that each thread will run — must be static, no $this.
         $task = static function (
             string $autoloader,
             string $inputPath,
@@ -248,38 +382,27 @@ final class Parser
             return $counts;
         };
 
-        // Launch workers - 1 threads (last slice runs in main thread).
         $futures = [];
         for ($w = 0; $w < $workers - 1; $w++) {
-            $runtime    = new \parallel\Runtime($autoloader);
+            $runtime     = new \parallel\Runtime($autoloader);
             $futures[$w] = $runtime->run(
                 $task,
-                $autoloader,
-                $inputPath,
-                $boundaries[$w],
-                $boundaries[$w + 1],
-                $pathIds,
-                $dateIds,
-                $pathCount,
-                $dateCount,
-                self::READ_CHUNK,
-                self::URL_PREFIX_LEN,
+                $autoloader, $inputPath,
+                $boundaries[$w], $boundaries[$w + 1],
+                $pathIds, $dateIds, $pathCount, $dateCount,
+                self::READ_CHUNK, self::URL_PREFIX_LEN,
             );
         }
 
-        // Main thread handles last slice while workers run.
         $counts = $this->parseRange(
-            $inputPath,
-            $boundaries[$workers - 1],
-            $boundaries[$workers],
+            $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
             $pathIds, $dateIds, $pathCount, $dateCount,
         );
 
-        // Collect and merge.
+        $total = $pathCount * $dateCount;
         foreach ($futures as $future) {
             $partial = $future->value();
-            $len     = count($counts);
-            for ($i = 0; $i < $len; $i++) {
+            for ($i = 0; $i < $total; $i++) {
                 $counts[$i] += $partial[$i];
             }
         }
@@ -288,7 +411,7 @@ final class Parser
     }
 
     /**
-     * Fallback: pcntl_fork. IPC via /dev/shm pack/unpack.
+     * Fallback: pcntl_fork with /dev/shm file IPC.
      *
      * @param array<string,int> $pathIds
      * @param array<int,string> $paths
@@ -308,10 +431,10 @@ final class Parser
         int    $workers,
     ): void {
         $boundaries = $this->buildBoundaries($inputPath, $fileSize, $workers);
-
-        $tmpDir   = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
-        $myPid    = getmypid();
-        $children = [];
+        $tmpDir     = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $myPid      = getmypid();
+        $children   = [];
+        $total      = $pathCount * $dateCount;
 
         for ($w = 0; $w < $workers - 1; $w++) {
             $tmpFile = "{$tmpDir}/p100m_{$myPid}_{$w}";
@@ -322,14 +445,13 @@ final class Parser
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
                     $pathIds, $dateIds, $pathCount, $dateCount,
                 );
-                $payload = pack('V*', ...$wCounts);
-                file_put_contents($tmpFile, $payload);
+                file_put_contents($tmpFile, pack('V*', ...$wCounts));
                 exit(0);
             }
 
             if ($pid < 0) throw new RuntimeException('Fork failed');
-
-            $children[] = ['pid' => $pid, 'start' => $boundaries[$w], 'end' => $boundaries[$w + 1], 'tmpFile' => $tmpFile];
+            $children[$w] = ['pid' => $pid, 'file' => $tmpFile,
+                             'start' => $boundaries[$w], 'end' => $boundaries[$w + 1]];
         }
 
         $counts = $this->parseRange(
@@ -337,18 +459,17 @@ final class Parser
             $pathIds, $dateIds, $pathCount, $dateCount,
         );
 
-        foreach ($children as $child) {
+        foreach ($children as $w => $child) {
             pcntl_waitpid($child['pid'], $status);
-            $childOk = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
-            $payload  = $childOk ? file_get_contents($child['tmpFile']) : false;
-            @unlink($child['tmpFile']);
+            $ok      = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
+            $payload = $ok ? file_get_contents($child['file']) : false;
+            @unlink($child['file']);
 
             if ($payload !== false && $payload !== '') {
                 $wCounts = unpack('V*', $payload);
                 if (is_array($wCounts)) {
-                    $j   = 1;
-                    $len = count($counts);
-                    for ($i = 0; $i < $len; $i++) {
+                    $j = 1;
+                    for ($i = 0; $i < $total; $i++) {
                         $counts[$i] += $wCounts[$j++];
                     }
                     continue;
@@ -359,8 +480,7 @@ final class Parser
                 $inputPath, $child['start'], $child['end'],
                 $pathIds, $dateIds, $pathCount, $dateCount,
             );
-            $len = count($counts);
-            for ($i = 0; $i < $len; $i++) {
+            for ($i = 0; $i < $total; $i++) {
                 $counts[$i] += $fallback[$i];
             }
         }
@@ -369,28 +489,7 @@ final class Parser
     }
 
     /**
-     * Build byte boundaries aligned to newlines.
-     * @return array<int,int>
-     */
-    private function buildBoundaries(string $inputPath, int $fileSize, int $workers): array
-    {
-        $boundaries = [0];
-        $bh         = fopen($inputPath, 'rb');
-        if ($bh === false) throw new RuntimeException("Cannot open: {$inputPath}");
-
-        for ($i = 1; $i < $workers; $i++) {
-            fseek($bh, (int) ($fileSize * $i / $workers));
-            fgets($bh);
-            $boundaries[] = (int) ftell($bh);
-        }
-
-        fclose($bh);
-        $boundaries[] = $fileSize;
-        return $boundaries;
-    }
-
-    /**
-     * Core hot loop — unchanged from the original proven implementation.
+     * Core hot loop — proven original implementation, untouched.
      *
      * @param array<string,int> $pathIds
      * @param array<string,int> $dateIds
@@ -406,11 +505,8 @@ final class Parser
         int    $dateCount,
     ): array {
         $counts = array_fill(0, $pathCount * $dateCount, 0);
-
         $handle = fopen($inputPath, 'rb');
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open input file: {$inputPath}");
-        }
+        if ($handle === false) throw new RuntimeException("Unable to open: {$inputPath}");
 
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
@@ -439,7 +535,6 @@ final class Parser
             }
 
             $slugStart = self::URL_PREFIX_LEN;
-
             while ($slugStart < $lastNl) {
                 $nlPos    = strpos($chunk, "\n", $slugStart);
                 $commaPos = $nlPos - 26;
@@ -489,13 +584,10 @@ final class Parser
         }
 
         $out = fopen($outputPath, 'wb');
-        if ($out === false) {
-            throw new RuntimeException("Unable to write output file: {$outputPath}");
-        }
+        if ($out === false) throw new RuntimeException("Unable to write: {$outputPath}");
 
         stream_set_write_buffer($out, self::READ_CHUNK);
         fwrite($out, '{');
-
         $firstPath = true;
 
         for ($p = 0; $p < $pathCount; $p++) {
